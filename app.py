@@ -38,12 +38,13 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# In-memory call state for testing
+# Keep call memory very small
 CALLS = {}
 
 ICC_PUBLIC_NAME = "Italian Custom Cabinets"
 ICC_PUBLIC_PHONE = "206-898-7677"
 ICC_PUBLIC_EMAIL = "shah@italiancustomcabinets.com"
+
 
 # -----------------------------
 # HELPERS
@@ -91,34 +92,41 @@ def send_sms(body):
 
 def ai_reply(user_text: str) -> str:
     system_prompt = """
-You are the official AI phone concierge for Italian Custom Cabinets (ICC).
-
-Your tone:
-- warm
-- concise
-- professional
-- helpful
+You are the official AI phone concierge for Italian Custom Cabinets.
 
 Rules:
 - Speak naturally for phone calls
-- Keep each answer short
-- If the caller asks for pricing, explain that final pricing depends on plans, measurements, and scope
-- If the caller asks for a human, say you will arrange follow-up
+- Keep every response short
+- Maximum 1 to 2 short sentences
 - Ask only one question at a time
-- Focus on collecting:
-  1. project type
-  2. timeline
-  3. whether they want a callback
+- Be warm, clear, and professional
+- If caller asks for pricing, say pricing depends on plans, measurements, and scope
+- If caller asks for a human, say you will arrange follow-up
+- Focus on project type, timeline, and callback need
 """
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-    )
-    return response.output_text.strip()
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            max_output_tokens=80
+        )
+        text = (response.output_text or "").strip()
+        if not text:
+            return "Sure. Could you tell me a little more about your project?"
+        return text
+
+    except Exception as e:
+        print("AI ERROR:", e)
+        return "Sorry, I had a small issue. Could you repeat that?"
+
+
+def trim_transcript(call_sid):
+    if call_sid in CALLS:
+        CALLS[call_sid]["transcript"] = CALLS[call_sid]["transcript"][-6:]
 
 
 def log_call_summary(call_sid, caller_number):
@@ -146,15 +154,22 @@ Transcript:
     with open("voice_leads.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    email_ok = send_email("New ICC Voice Lead", summary)
-    sms_ok = send_sms(f"New ICC voice lead from {caller_number}")
+    # Re-enable later after voice flow is stable
+    # email_ok = send_email("New ICC Voice Lead", summary)
+    # sms_ok = send_sms(f"New ICC voice lead from {caller_number}")
+    # print(f"Email sent: {email_ok} | SMS sent: {sms_ok}")
 
-    print(f"Email sent: {email_ok} | SMS sent: {sms_ok}")
+    print("Lead saved locally")
 
 
 # -----------------------------
 # ROUTES
 # -----------------------------
+@app.route("/", methods=["GET"])
+def home():
+    return "ICC AI Voice Agent is running.", 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
@@ -171,6 +186,7 @@ def voice():
     }
 
     vr = VoiceResponse()
+
     gather = Gather(
         input="speech",
         speech_timeout="auto",
@@ -199,16 +215,20 @@ def gather():
             "transcript": [],
         }
 
+    trim_transcript(call_sid)
+
     if speech_result:
         CALLS[call_sid]["transcript"].append(f"Caller: {speech_result}")
 
-    reply_text = ai_reply(speech_result or "The caller was silent.")
+    short_input = (speech_result or "The caller was silent.")[:200]
+    reply_text = ai_reply(short_input)
+
+    trim_transcript(call_sid)
     CALLS[call_sid]["transcript"].append(f"AI: {reply_text}")
 
     vr = VoiceResponse()
 
-    # simple handoff detection
-    lower = speech_result.lower()
+    lower = speech_result.lower() if speech_result else ""
     wants_human = any(x in lower for x in [
         "human", "person", "agent", "representative", "call me", "callback"
     ])
