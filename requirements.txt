@@ -1,5 +1,5 @@
-flask
-gunicorn
+Flask==3.0.3
+gunicorn==22.0.0
 openai
 python-dotenv
-twilio
+twilio==9.1.0
