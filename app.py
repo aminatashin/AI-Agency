@@ -1,9 +1,9 @@
 import os
 import sqlite3
 import traceback
+import smtplib
 from datetime import datetime, timezone
 from email.message import EmailMessage
-import smtplib
 
 from flask import Flask, request, Response, jsonify
 from twilio.rest import Client
@@ -12,6 +12,9 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 
 app = Flask(__name__)
 
+# -----------------------------
+# ENV
+# -----------------------------
 DB_PATH = os.environ.get("DB_PATH", "calls.db")
 PORT = int(os.environ.get("PORT", "10000"))
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
@@ -32,15 +35,17 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "")
 VOICE_LANGUAGE = os.environ.get("VOICE_LANGUAGE", "en-US")
 VOICE_NAME = os.environ.get("VOICE_NAME", "alice")
 
-FIELDS = ["project_type", "city", "timeline", "caller_name"]
-QUESTIONS = {
-    "project_type": "Thanks for calling Italian Custom Cabinets. What type of project is this? For example, kitchen, bathroom, or closet.",
-    "city": "What city is the project in?",
-    "timeline": "What is your timeline for the project?",
-    "caller_name": "What is your name?",
-}
+QUESTIONS = [
+    ("project_type", "Thanks for calling Italian Custom Cabinets. What type of project is this? For example, kitchen, bathroom, or closet."),
+    ("city", "What city is the project in?"),
+    ("timeline", "What is your timeline for the project?"),
+    ("caller_name", "What is your name?"),
+]
 
 
+# -----------------------------
+# HELPERS
+# -----------------------------
 def xml_response(twiml: str):
     return Response(twiml, mimetype="application/xml")
 
@@ -59,8 +64,8 @@ def safe_text(value, max_len=200):
 
 
 def normalize_answer(value, fallback="Not provided"):
-    value = safe_text(value)
-    return value if value else fallback
+    text = safe_text(value)
+    return text if text else fallback
 
 
 def get_conn():
@@ -96,8 +101,8 @@ def init_db():
 
 
 def upsert_call(call_sid, from_number="", to_number="", call_status=""):
-    conn = get_conn()
     ts = now_iso()
+    conn = get_conn()
     conn.execute(
         """
         INSERT INTO calls (call_sid, from_number, to_number, call_status, created_at, updated_at)
@@ -117,15 +122,19 @@ def upsert_call(call_sid, from_number="", to_number="", call_status=""):
 def update_call(call_sid, **kwargs):
     if not kwargs:
         return
-    conn = get_conn()
     columns = []
     values = []
     for key, value in kwargs.items():
         columns.append(f"{key} = ?")
-        values.append(safe_text(value) if isinstance(value, str) else value)
+        if isinstance(value, str):
+            values.append(safe_text(value, 500))
+        else:
+            values.append(value)
     columns.append("updated_at = ?")
     values.append(now_iso())
     values.append(call_sid)
+
+    conn = get_conn()
     conn.execute(f"UPDATE calls SET {', '.join(columns)} WHERE call_sid = ?", values)
     conn.commit()
     conn.close()
@@ -138,12 +147,10 @@ def get_call(call_sid):
     return dict(row) if row else None
 
 
-def next_field(current_field):
-    idx = FIELDS.index(current_field)
-    return FIELDS[idx + 1] if idx + 1 < len(FIELDS) else None
-
-
 def build_summary(record):
+    if not record:
+        return "No call record found."
+
     return "\n".join([
         "ICC call summary",
         f"Call SID: {record.get('call_sid', '')}",
@@ -155,7 +162,7 @@ def build_summary(record):
         f"Timeline: {normalize_answer(record.get('timeline'))}",
         f"Caller name: {normalize_answer(record.get('caller_name'))}",
         f"Last completed field: {normalize_answer(record.get('last_field'))}",
-        f"Error: {normalize_answer(record.get('error_message'))}",
+        f"Error: {normalize_answer(record.get('error_message'), fallback='None')}",
     ])
 
 
@@ -195,7 +202,8 @@ def send_sms(body):
         return False
 
     client = get_twilio_client()
-    if not client:
+    if client is None:
+        print("SMS skipped: Twilio client not available")
         return False
 
     client.messages.create(
@@ -209,15 +217,18 @@ def send_sms(body):
 def send_notifications_if_needed(call_sid, reason="completed"):
     record = get_call(call_sid)
     if not record:
+        print(f"No record found for {call_sid}")
         return
 
     if int(record.get("notifications_sent") or 0) == 1:
+        print(f"Notifications already sent for {call_sid}")
         return
 
     summary = build_summary(record)
     subject = f"ICC Call Lead - {normalize_answer(record.get('caller_name'), 'Unknown Caller')}"
     sms_body = (
-        f"ICC Lead | Name: {normalize_answer(record.get('caller_name'))} | "
+        f"ICC Lead | "
+        f"Name: {normalize_answer(record.get('caller_name'))} | "
         f"Project: {normalize_answer(record.get('project_type'))} | "
         f"City: {normalize_answer(record.get('city'))} | "
         f"Timeline: {normalize_answer(record.get('timeline'))} | "
@@ -230,12 +241,14 @@ def send_notifications_if_needed(call_sid, reason="completed"):
 
     try:
         email_ok = send_email(subject, summary)
+        print(f"Email sent: {email_ok}")
     except Exception as exc:
         print(traceback.format_exc())
         errors.append(f"Email failed: {exc}")
 
     try:
         sms_ok = send_sms(sms_body)
+        print(f"SMS sent: {sms_ok}")
     except Exception as exc:
         print(traceback.format_exc())
         errors.append(f"SMS failed: {exc}")
@@ -250,37 +263,42 @@ def send_notifications_if_needed(call_sid, reason="completed"):
         update_call(call_sid, error_message=" | ".join(errors))
 
 
-def build_gather(question_text, action_url):
+def ask_question_twiml(question_text, step_number):
     response = VoiceResponse()
+
     gather = Gather(
         input="speech",
-        action=action_url,
+        action=f"{BASE_URL}/gather?step={step_number}",
         method="POST",
         language=VOICE_LANGUAGE,
         timeout=4,
         speech_timeout="auto",
         action_on_empty_result=True,
-        hints="kitchen,bathroom,closet,remodel,new construction,seattle,bellevue,kirkland,lynnwood"
+        hints="kitchen,bathroom,closet,laundry room,office,garage,new construction,remodel,seattle,bellevue,kirkland,lynnwood,redmond,bothell"
     )
     gather.say(question_text, voice=VOICE_NAME, language=VOICE_LANGUAGE)
     response.append(gather)
 
-    # If Twilio gets nothing, it still posts because action_on_empty_result=True.
-    # This line is just a hard fallback.
-    response.redirect(action_url, method="POST")
+    # If no speech is captured, Twilio should still POST because action_on_empty_result=True.
+    # This redirect is only an extra hard fallback.
+    response.redirect(f"{BASE_URL}/gather?step={step_number}", method="POST")
+
     return xml_response(str(response))
 
 
-def end_call_with_message(text):
+def say_and_hangup(text):
     response = VoiceResponse()
     response.say(text, voice=VOICE_NAME, language=VOICE_LANGUAGE)
     response.hangup()
     return xml_response(str(response))
 
 
+# -----------------------------
+# ROUTES
+# -----------------------------
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "icc-voice-agent"})
+    return jsonify({"ok": True, "service": "icc-voice-agent"}), 200
 
 
 @app.route("/sms", methods=["POST"])
@@ -293,7 +311,7 @@ def voice():
     call_sid = safe_text(request.values.get("CallSid", ""))
     try:
         if not call_sid:
-            return end_call_with_message("Sorry, this call could not be processed.")
+            return say_and_hangup("Sorry, this call could not be processed.")
 
         upsert_call(
             call_sid=call_sid,
@@ -302,31 +320,29 @@ def voice():
             call_status=request.values.get("CallStatus", "in-progress"),
         )
 
-        return build_gather(
-            QUESTIONS["project_type"],
-            f"{BASE_URL}/step/project_type"
-        )
+        return ask_question_twiml(QUESTIONS[0][1], 0)
+
     except Exception as exc:
         print(traceback.format_exc())
         if call_sid:
-            update_call(call_sid, error_message=f"/voice failure: {safe_text(str(exc), 300)}")
-            send_notifications_if_needed(call_sid, reason="voice-error")
-        return end_call_with_message("Sorry, there was a system issue. We will follow up.")
+            update_call(call_sid, error_message=f"/voice failure: {safe_text(str(exc), 500)}")
+        return say_and_hangup("Sorry, there was a system issue. We will follow up.")
 
 
-@app.route("/step/<field>", methods=["POST"])
-def step(field):
+@app.route("/gather", methods=["POST"])
+def gather():
     call_sid = safe_text(request.values.get("CallSid", ""))
     speech_result = safe_text(request.values.get("SpeechResult", ""))
+    step_raw = request.args.get("step", "0")
 
     try:
         if not call_sid:
-            return end_call_with_message("Sorry, this call could not be processed.")
+            return say_and_hangup("Sorry, this call could not be processed.")
 
-        if field not in FIELDS:
-            update_call(call_sid, error_message=f"Invalid field: {field}")
-            send_notifications_if_needed(call_sid, reason="invalid-field")
-            return end_call_with_message("Sorry, there was a system issue. We will follow up.")
+        try:
+            step_number = int(step_raw)
+        except ValueError:
+            step_number = 0
 
         upsert_call(
             call_sid=call_sid,
@@ -335,22 +351,22 @@ def step(field):
             call_status=request.values.get("CallStatus", "in-progress"),
         )
 
-        answer = normalize_answer(speech_result)
-        update_call(call_sid, **{field: answer}, last_field=field)
+        # Save answer for the current question if this step exists
+        if 0 <= step_number < len(QUESTIONS):
+            field_name = QUESTIONS[step_number][0]
+            answer = normalize_answer(speech_result)
+            update_call(call_sid, **{field_name: answer}, last_field=field_name)
 
-        nxt = next_field(field)
-        if nxt:
-            return build_gather(
-                QUESTIONS[nxt],
-                f"{BASE_URL}/step/{nxt}"
-            )
+        next_step = step_number + 1
 
+        if next_step < len(QUESTIONS):
+            return ask_question_twiml(QUESTIONS[next_step][1], next_step)
+
+        # Finished all questions
         record = get_call(call_sid)
         update_call(call_sid, call_status="completed")
 
-        send_notifications_if_needed(call_sid, reason="completed-in-call")
-
-        return end_call_with_message(
+        return say_and_hangup(
             f"Thank you {normalize_answer(record.get('caller_name'), 'there')}. "
             f"We have your {normalize_answer(record.get('project_type'))} project in "
             f"{normalize_answer(record.get('city'))}, with timeline {normalize_answer(record.get('timeline'))}. "
@@ -360,9 +376,8 @@ def step(field):
     except Exception as exc:
         print(traceback.format_exc())
         if call_sid:
-            update_call(call_sid, error_message=f"/step/{field} failure: {safe_text(str(exc), 300)}")
-            send_notifications_if_needed(call_sid, reason=f"step-error-{field}")
-        return end_call_with_message("Sorry, there was a system issue. We will follow up.")
+            update_call(call_sid, error_message=f"/gather failure: {safe_text(str(exc), 500)}")
+        return say_and_hangup("Sorry, there was a system issue. We will follow up.")
 
 
 @app.route("/status", methods=["POST"])
@@ -385,6 +400,7 @@ def status_callback():
             send_notifications_if_needed(call_sid, reason=f"status:{call_status}")
 
         return ("", 204)
+
     except Exception:
         print(traceback.format_exc())
         return ("", 204)
@@ -396,12 +412,17 @@ def handle_error(exc):
     print(traceback.format_exc())
 
     if call_sid:
-        update_call(call_sid, error_message=f"Unhandled app error: {safe_text(str(exc), 300)}")
-        send_notifications_if_needed(call_sid, reason="unhandled-error")
+        try:
+            update_call(call_sid, error_message=f"Unhandled app error: {safe_text(str(exc), 500)}")
+        except Exception:
+            print(traceback.format_exc())
 
-    return end_call_with_message("Sorry, there was a system issue. We will follow up.")
+    return say_and_hangup("Sorry, there was a system issue. We will follow up.")
 
 
+# -----------------------------
+# STARTUP
+# -----------------------------
 init_db()
 
 if __name__ == "__main__":
