@@ -7,18 +7,15 @@ from email.mime.multipart import MIMEMultipart
 
 from flask import Flask, request
 from dotenv import load_dotenv
-from openai import OpenAI
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client as TwilioClient
 
 load_dotenv()
-
 app = Flask(__name__)
 
 # -----------------------------
 # ENV / CONFIG
 # -----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = os.getenv("SMTP_PORT", "465")
 SMTP_USERNAME = os.getenv("SMTP_USERNAME")
@@ -33,28 +30,17 @@ ALERT_SMS_TO = os.getenv("ALERT_SMS_TO")
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# -----------------------------
-# CALL STATE
-# -----------------------------
 CALLS = {}
 
-FIELDS = [
-    "project_type",
-    "city",
-    "timeline",
-    "callback",
-    "name"
-]
+FIELDS = ["project_type", "city", "timeline", "name"]
 
 QUESTIONS = {
     "project_type": "Are you calling about a kitchen, bathroom, closet, or another project?",
-    "city": "What city is the project located in?",
+    "city": "What city is the project in?",
     "timeline": "What is your timeline for the project?",
-    "callback": "Would you like a callback from our team?",
     "name": "May I have your name, please?"
 }
+
 
 # -----------------------------
 # HELPERS
@@ -74,10 +60,10 @@ def send_email(subject, body):
         with smtplib.SMTP_SSL(SMTP_HOST, int(SMTP_PORT)) as server:
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.send_message(msg)
-        print("Email sent successfully")
+        print("✅ Email sent successfully")
         return True
     except Exception as e:
-        print("Email failed:", e)
+        print("❌ Email failed:", e)
         return False
 
 
@@ -93,10 +79,10 @@ def send_sms(body):
             from_=TWILIO_FROM_NUMBER,
             to=ALERT_SMS_TO
         )
-        print("SMS sent:", msg.sid)
+        print("✅ SMS sent:", msg.sid)
         return True
     except Exception as e:
-        print("SMS failed:", e)
+        print("❌ SMS failed:", e)
         return False
 
 
@@ -108,10 +94,10 @@ def create_call(call_sid, caller_number):
             "project_type": "",
             "city": "",
             "timeline": "",
-            "callback": "",
             "name": ""
         },
-        "transcript": []
+        "transcript": [],
+        "notified": False
     }
 
 
@@ -132,28 +118,47 @@ def next_question(call_sid):
 def save_answer(call_sid, speech_text):
     field = current_field(call_sid)
     if field:
-        CALLS[call_sid]["answers"][field] = speech_text.strip()
+        CALLS[call_sid]["answers"][field] = speech_text.strip()[:120]
         CALLS[call_sid]["current_step"] += 1
 
 
 def build_summary(call_sid):
     data = CALLS[call_sid]
     a = data["answers"]
-    transcript = "\n".join(data["transcript"])
+    transcript = "\n".join(data["transcript"][-8:])
 
     return f"""
 New ICC Voice Lead
 
 Caller Number: {data['caller_number']}
-Name: {a['name']}
 Project Type: {a['project_type']}
 City: {a['city']}
 Timeline: {a['timeline']}
-Callback Requested: {a['callback']}
+Name: {a['name']}
 
 Transcript:
 {transcript}
 """.strip()
+
+
+def build_spoken_summary(call_sid):
+    a = CALLS[call_sid]["answers"]
+
+    parts = []
+
+    if a["project_type"]:
+        parts.append(f"project type: {a['project_type']}")
+    if a["city"]:
+        parts.append(f"city: {a['city']}")
+    if a["timeline"]:
+        parts.append(f"timeline: {a['timeline']}")
+    if a["name"]:
+        parts.append(f"name: {a['name']}")
+
+    if not parts:
+        return "I have recorded your request."
+
+    return "Here is a quick summary. " + ". ".join(parts) + "."
 
 
 def save_lead_file(call_sid):
@@ -162,36 +167,28 @@ def save_lead_file(call_sid):
         "timestamp": datetime.now().isoformat(),
         "caller_number": data["caller_number"],
         "answers": data["answers"],
-        "transcript": data["transcript"]
+        "transcript": data["transcript"][-8:]
     }
     with open("voice_leads.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def ai_fallback(user_text):
-    if not client:
-        return "Could you please say that again?"
+def notify_if_needed(call_sid):
+    data = CALLS[call_sid]
+    if data["notified"]:
+        return
 
-    try:
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {
-                    "role": "system",
-                    "content": "You are a very short phone assistant for a cabinetry company. Reply in one short sentence only."
-                },
-                {
-                    "role": "user",
-                    "content": user_text[:150]
-                }
-            ],
-            max_output_tokens=40
-        )
-        text = (response.output_text or "").strip()
-        return text if text else "Could you please say that again?"
-    except Exception as e:
-        print("Fallback AI error:", e)
-        return "Could you please say that again?"
+    summary = build_summary(call_sid)
+    save_lead_file(call_sid)
+
+    email_ok = send_email("New ICC Voice Lead", summary)
+    sms_ok = send_sms(
+        f"New ICC lead from {data['caller_number']} | "
+        f"{data['answers']['project_type']} | {data['answers']['city']} | {data['answers']['name']}"
+    )
+
+    print(f"Email sent: {email_ok} | SMS sent: {sms_ok}")
+    data["notified"] = True
 
 
 def wants_human(text):
@@ -201,6 +198,7 @@ def wants_human(text):
         "call me", "callback", "someone call me"
     ]
     return any(t in lower for t in triggers)
+
 
 # -----------------------------
 # ROUTES
@@ -226,16 +224,18 @@ def voice():
     gather = Gather(
         input="speech",
         speech_timeout="auto",
+        timeout=4,
         action=f"{PUBLIC_BASE_URL}/gather",
         method="POST"
     )
     gather.say(
         "Hello. Thank you for calling Italian Custom Cabinets. "
-        f"{QUESTIONS['project_type']}"
+        "Please answer briefly. "
+        + QUESTIONS["project_type"]
     )
     vr.append(gather)
 
-    vr.say("I didn't catch that. Please call again.")
+    vr.say("I did not catch that. Please call again.")
     return str(vr), 200, {"Content-Type": "application/xml"}
 
 
@@ -250,52 +250,62 @@ def gather():
 
     vr = VoiceResponse()
 
-    if speech_result:
-        CALLS[call_sid]["transcript"].append(f"Caller: {speech_result}")
+    if not speech_result:
+        gather_more = Gather(
+            input="speech",
+            speech_timeout="auto",
+            timeout=4,
+            action=f"{PUBLIC_BASE_URL}/gather",
+            method="POST"
+        )
+        gather_more.say("Sorry, I did not catch that. Please answer briefly.")
+        vr.append(gather_more)
+        vr.say("Thank you for calling. Goodbye.")
+        vr.hangup()
+        return str(vr), 200, {"Content-Type": "application/xml"}
 
-    # human request at any point
+    speech_result = speech_result[:160]
+    CALLS[call_sid]["transcript"].append(f"Caller: {speech_result}")
+    CALLS[call_sid]["transcript"] = CALLS[call_sid]["transcript"][-8:]
+
+    # If caller asks for human at any point, finish early and notify
     if wants_human(speech_result):
-        CALLS[call_sid]["answers"]["callback"] = "Yes"
-        summary = build_summary(call_sid)
-        save_lead_file(call_sid)
-        send_email("New ICC Voice Lead", summary)
-        send_sms(f"New ICC voice lead from {caller_number}")
-        vr.say("Absolutely. I will send your details to our team for follow up. Thank you for calling.")
+        notify_if_needed(call_sid)
+        summary_text = build_spoken_summary(call_sid)
+        vr.say(summary_text)
+        vr.say("Thank you. A team member will follow up with you soon. Goodbye.")
         vr.hangup()
         return str(vr), 200, {"Content-Type": "application/xml"}
 
     field = current_field(call_sid)
-
     if field:
         save_answer(call_sid, speech_result)
 
-    # If all questions are done
+    # If all questions are complete, summarize + notify + end call
     if CALLS[call_sid]["current_step"] >= len(FIELDS):
-        summary = build_summary(call_sid)
-        save_lead_file(call_sid)
-        send_email("New ICC Voice Lead", summary)
-        send_sms(f"New ICC voice lead from {caller_number}")
-        vr.say("Thank you. I have recorded your information, and a team member will follow up with you soon. Goodbye.")
+        notify_if_needed(call_sid)
+        summary_text = build_spoken_summary(call_sid)
+        vr.say(summary_text)
+        vr.say("Thank you. A team member will follow up with you soon. Goodbye.")
         vr.hangup()
         return str(vr), 200, {"Content-Type": "application/xml"}
 
     # Ask next fixed question
     question = next_question(call_sid)
-    if not question:
-        question = ai_fallback(speech_result)
-
     CALLS[call_sid]["transcript"].append(f"AI: {question}")
+    CALLS[call_sid]["transcript"] = CALLS[call_sid]["transcript"][-8:]
 
     gather_more = Gather(
         input="speech",
         speech_timeout="auto",
+        timeout=4,
         action=f"{PUBLIC_BASE_URL}/gather",
         method="POST"
     )
     gather_more.say(question)
     vr.append(gather_more)
 
-    vr.say("Thank you for calling Italian Custom Cabinets. Goodbye.")
+    vr.say("Thank you for calling. Goodbye.")
     vr.hangup()
 
     return str(vr), 200, {"Content-Type": "application/xml"}
