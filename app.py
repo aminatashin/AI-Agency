@@ -122,6 +122,7 @@ def upsert_call(call_sid, from_number="", to_number="", call_status=""):
 def update_call(call_sid, **kwargs):
     if not kwargs:
         return
+
     columns = []
     values = []
     for key, value in kwargs.items():
@@ -130,6 +131,7 @@ def update_call(call_sid, **kwargs):
             values.append(safe_text(value, 500))
         else:
             values.append(value)
+
     columns.append("updated_at = ?")
     values.append(now_iso())
     values.append(call_sid)
@@ -167,27 +169,44 @@ def build_summary(record):
 
 
 def send_email(subject, body):
+    print("EMAIL DEBUG: starting send_email")
+
     if not all([SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO]):
-        print("Email skipped: missing SMTP config")
+        print("EMAIL DEBUG: missing SMTP config")
+        print("EMAIL DEBUG: SMTP_HOST =", SMTP_HOST)
+        print("EMAIL DEBUG: SMTP_PORT =", SMTP_PORT)
+        print("EMAIL DEBUG: SMTP_USERNAME =", SMTP_USERNAME)
+        print("EMAIL DEBUG: SMTP_PASSWORD exists =", bool(SMTP_PASSWORD))
+        print("EMAIL DEBUG: EMAIL_FROM =", EMAIL_FROM)
+        print("EMAIL DEBUG: EMAIL_TO =", EMAIL_TO)
         return False
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg.set_content(body)
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg.set_content(body)
 
-    if SMTP_USE_TLS:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(msg)
+        if SMTP_USE_TLS:
+            print("EMAIL DEBUG: using TLS")
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.starttls()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg)
+        else:
+            print("EMAIL DEBUG: using SSL")
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg)
 
-    return True
+        print("EMAIL DEBUG: email sent successfully")
+        return True
+
+    except Exception as exc:
+        print(f"EMAIL DEBUG: send failed: {exc}")
+        print(traceback.format_exc())
+        return False
 
 
 def get_twilio_client():
@@ -197,31 +216,46 @@ def get_twilio_client():
 
 
 def send_sms(body):
+    print("SMS DEBUG: starting send_sms")
+
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, SMS_FROM, SMS_TO]):
-        print("SMS skipped: missing Twilio SMS config")
+        print("SMS DEBUG: missing Twilio SMS config")
+        print("SMS DEBUG: SID exists =", bool(TWILIO_ACCOUNT_SID))
+        print("SMS DEBUG: TOKEN exists =", bool(TWILIO_AUTH_TOKEN))
+        print("SMS DEBUG: SMS_FROM =", SMS_FROM)
+        print("SMS DEBUG: SMS_TO =", SMS_TO)
         return False
 
-    client = get_twilio_client()
-    if client is None:
-        print("SMS skipped: Twilio client not available")
-        return False
+    try:
+        client = get_twilio_client()
+        if client is None:
+            print("SMS DEBUG: Twilio client not available")
+            return False
 
-    client.messages.create(
-        body=body[:1500],
-        from_=SMS_FROM,
-        to=SMS_TO,
-    )
-    return True
+        client.messages.create(
+            body=body[:1500],
+            from_=SMS_FROM,
+            to=SMS_TO,
+        )
+        print("SMS DEBUG: sms sent successfully")
+        return True
+
+    except Exception as exc:
+        print(f"SMS DEBUG: send failed: {exc}")
+        print(traceback.format_exc())
+        return False
 
 
 def send_notifications_if_needed(call_sid, reason="completed"):
+    print(f"NOTIFY DEBUG: starting send_notifications_if_needed for {call_sid} with reason={reason}")
+
     record = get_call(call_sid)
     if not record:
-        print(f"No record found for {call_sid}")
+        print(f"NOTIFY DEBUG: no record found for {call_sid}")
         return
 
     if int(record.get("notifications_sent") or 0) == 1:
-        print(f"Notifications already sent for {call_sid}")
+        print(f"NOTIFY DEBUG: notifications already sent for {call_sid}")
         return
 
     summary = build_summary(record)
@@ -241,14 +275,14 @@ def send_notifications_if_needed(call_sid, reason="completed"):
 
     try:
         email_ok = send_email(subject, summary)
-        print(f"Email sent: {email_ok}")
+        print(f"NOTIFY DEBUG: email_ok={email_ok}")
     except Exception as exc:
         print(traceback.format_exc())
         errors.append(f"Email failed: {exc}")
 
     try:
         sms_ok = send_sms(sms_body)
-        print(f"SMS sent: {sms_ok}")
+        print(f"NOTIFY DEBUG: sms_ok={sms_ok}")
     except Exception as exc:
         print(traceback.format_exc())
         errors.append(f"SMS failed: {exc}")
@@ -259,8 +293,13 @@ def send_notifications_if_needed(call_sid, reason="completed"):
             notifications_sent=1,
             notification_reason=reason
         )
+        print(f"NOTIFY DEBUG: notifications marked as sent for {call_sid}")
     elif errors:
         update_call(call_sid, error_message=" | ".join(errors))
+        print(f"NOTIFY DEBUG: saved notification errors for {call_sid}")
+    else:
+        update_call(call_sid, error_message="Email and SMS both returned False")
+        print(f"NOTIFY DEBUG: both email and SMS returned False for {call_sid}")
 
 
 def ask_question_twiml(question_text, step_number):
@@ -279,8 +318,6 @@ def ask_question_twiml(question_text, step_number):
     gather.say(question_text, voice=VOICE_NAME, language=VOICE_LANGUAGE)
     response.append(gather)
 
-    # If no speech is captured, Twilio should still POST because action_on_empty_result=True.
-    # This redirect is only an extra hard fallback.
     response.redirect(f"{BASE_URL}/gather?step={step_number}", method="POST")
 
     return xml_response(str(response))
@@ -309,6 +346,8 @@ def sms_webhook():
 @app.route("/voice", methods=["POST"])
 def voice():
     call_sid = safe_text(request.values.get("CallSid", ""))
+    print(f"VOICE DEBUG: incoming call, CallSid={call_sid}")
+
     try:
         if not call_sid:
             return say_and_hangup("Sorry, this call could not be processed.")
@@ -335,6 +374,8 @@ def gather():
     speech_result = safe_text(request.values.get("SpeechResult", ""))
     step_raw = request.args.get("step", "0")
 
+    print(f"GATHER DEBUG: CallSid={call_sid}, step={step_raw}, SpeechResult={speech_result}")
+
     try:
         if not call_sid:
             return say_and_hangup("Sorry, this call could not be processed.")
@@ -351,20 +392,20 @@ def gather():
             call_status=request.values.get("CallStatus", "in-progress"),
         )
 
-        # Save answer for the current question if this step exists
         if 0 <= step_number < len(QUESTIONS):
             field_name = QUESTIONS[step_number][0]
             answer = normalize_answer(speech_result)
             update_call(call_sid, **{field_name: answer}, last_field=field_name)
+            print(f"GATHER DEBUG: saved {field_name}={answer}")
 
         next_step = step_number + 1
 
         if next_step < len(QUESTIONS):
             return ask_question_twiml(QUESTIONS[next_step][1], next_step)
 
-        # Finished all questions
         record = get_call(call_sid)
         update_call(call_sid, call_status="completed")
+        print(f"GATHER DEBUG: completed call for {call_sid}")
 
         return say_and_hangup(
             f"Thank you {normalize_answer(record.get('caller_name'), 'there')}. "
@@ -385,8 +426,11 @@ def status_callback():
     call_sid = safe_text(request.values.get("CallSid", ""))
     call_status = safe_text(request.values.get("CallStatus", ""))
 
+    print(f"STATUS DEBUG: CallSid={call_sid}, CallStatus={call_status}")
+
     try:
         if not call_sid:
+            print("STATUS DEBUG: missing CallSid")
             return ("", 204)
 
         upsert_call(
@@ -397,7 +441,10 @@ def status_callback():
         )
 
         if call_status in {"completed", "busy", "failed", "no-answer", "canceled"}:
+            print(f"STATUS DEBUG: terminal status received: {call_status}")
             send_notifications_if_needed(call_sid, reason=f"status:{call_status}")
+        else:
+            print(f"STATUS DEBUG: non-terminal status, skipping notifications: {call_status}")
 
         return ("", 204)
 
