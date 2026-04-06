@@ -12,9 +12,6 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 
 app = Flask(__name__)
 
-# -----------------------------
-# ENV
-# -----------------------------
 DB_PATH = os.environ.get("DB_PATH", "calls.db")
 PORT = int(os.environ.get("PORT", "10000"))
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
@@ -33,9 +30,7 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = os.environ.get("EMAIL_TO", "")
 
 VOICE_LANGUAGE = os.environ.get("VOICE_LANGUAGE", "en-US")
-VOICE_NAME = os.environ.get("VOICE_NAME", "alice")
-
-# This is your real phone number that Twilio should call when user presses 1
+VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna")
 HUMAN_TRANSFER_NUMBER = os.environ.get("HUMAN_TRANSFER_NUMBER", "")
 
 QUESTIONS = [
@@ -46,9 +41,6 @@ QUESTIONS = [
 ]
 
 
-# -----------------------------
-# HELPERS
-# -----------------------------
 def xml_response(twiml: str):
     return Response(twiml, mimetype="application/xml")
 
@@ -306,11 +298,7 @@ def send_notifications_if_needed(call_sid, reason="completed"):
         errors.append(f"SMS failed: {exc}")
 
     if email_ok or sms_ok:
-        update_call(
-            call_sid,
-            notifications_sent=1,
-            notification_reason=reason
-        )
+        update_call(call_sid, notifications_sent=1, notification_reason=reason)
         print(f"NOTIFY DEBUG: notifications marked as sent for {call_sid}")
     elif errors:
         update_call(call_sid, error_message=" | ".join(errors))
@@ -339,7 +327,6 @@ def intro_menu_twiml():
     )
     response.append(gather)
 
-    # If no key is pressed, continue to AI intake
     response.redirect(f"{BASE_URL}/start-intake", method="POST")
     return xml_response(str(response))
 
@@ -378,7 +365,7 @@ def transfer_to_human_twiml(call_sid):
         print("TRANSFER DEBUG: HUMAN_TRANSFER_NUMBER missing")
         update_call(call_sid, error_message="Human transfer requested but HUMAN_TRANSFER_NUMBER is missing")
         response.say(
-            "Sorry, we could not connect you right now. Please leave your information after the tone, or call back shortly.",
+            "Sorry, we could not connect you right now. We will follow up shortly.",
             voice=VOICE_NAME,
             language=VOICE_LANGUAGE
         )
@@ -388,28 +375,13 @@ def transfer_to_human_twiml(call_sid):
     print(f"TRANSFER DEBUG: transferring {call_sid} to {HUMAN_TRANSFER_NUMBER}")
     update_call(call_sid, transfer_requested=1, transfer_to=HUMAN_TRANSFER_NUMBER, last_field="human_transfer")
 
-    response.say(
-        "Please hold while I connect you.",
-        voice=VOICE_NAME,
-        language=VOICE_LANGUAGE
-    )
-    response.dial(
-        HUMAN_TRANSFER_NUMBER,
-        timeout=20,
-        caller_id=request.values.get("To", "")
-    )
-    response.say(
-        "Sorry, no one is available right now. We will follow up shortly.",
-        voice=VOICE_NAME,
-        language=VOICE_LANGUAGE
-    )
+    response.say("Please hold while I connect you.", voice=VOICE_NAME, language=VOICE_LANGUAGE)
+    response.dial(HUMAN_TRANSFER_NUMBER, timeout=20, caller_id=request.values.get("To", ""))
+    response.say("Sorry, no one is available right now. We will follow up shortly.", voice=VOICE_NAME, language=VOICE_LANGUAGE)
     response.hangup()
     return xml_response(str(response))
 
 
-# -----------------------------
-# ROUTES
-# -----------------------------
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"ok": True, "service": "icc-voice-agent"}), 200
@@ -598,9 +570,6 @@ def handle_error(exc):
     return say_and_hangup("Sorry, there was a system issue. We will follow up.")
 
 
-# -----------------------------
-# STARTUP
-# -----------------------------
 init_db()
 ensure_column_exists("transfer_requested", "transfer_requested INTEGER DEFAULT 0")
 ensure_column_exists("transfer_to", "transfer_to TEXT")
