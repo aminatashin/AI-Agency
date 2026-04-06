@@ -1,17 +1,25 @@
 import os
+import json
 import sqlite3
 import traceback
 import smtplib
+import logging
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
+import gspread
+from google.oauth2.service_account import Credentials
 from flask import Flask, request, Response, jsonify
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
+# -----------------------------
+# ENV
+# -----------------------------
 DB_PATH = os.environ.get("DB_PATH", "calls.db")
 PORT = int(os.environ.get("PORT", "10000"))
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
@@ -31,7 +39,10 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "")
 
 VOICE_LANGUAGE = os.environ.get("VOICE_LANGUAGE", "en-US")
 VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna")
+
 HUMAN_TRANSFER_NUMBER = os.environ.get("HUMAN_TRANSFER_NUMBER", "")
+GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 QUESTIONS = [
     ("project_type", "What type of project is this? For example, kitchen, bathroom, or closet."),
@@ -41,6 +52,9 @@ QUESTIONS = [
 ]
 
 
+# -----------------------------
+# HELPERS
+# -----------------------------
 def xml_response(twiml: str):
     return Response(twiml, mimetype="application/xml")
 
@@ -49,7 +63,7 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def safe_text(value, max_len=200):
+def safe_text(value, max_len=300):
     if value is None:
         return ""
     text = str(value).replace("\n", " ").replace("\r", " ").strip()
@@ -88,6 +102,7 @@ def init_db():
             error_message TEXT,
             transfer_requested INTEGER DEFAULT 0,
             transfer_to TEXT,
+            sheet_logged INTEGER DEFAULT 0,
             created_at TEXT,
             updated_at TEXT
         )
@@ -135,7 +150,7 @@ def update_call(call_sid, **kwargs):
     for key, value in kwargs.items():
         columns.append(f"{key} = ?")
         if isinstance(value, str):
-            values.append(safe_text(value, 500))
+            values.append(safe_text(value, 1000))
         else:
             values.append(value)
 
@@ -162,6 +177,7 @@ def build_summary(record):
 
     return "\n".join([
         "ICC call summary",
+        f"Timestamp: {now_iso()}",
         f"Call SID: {record.get('call_sid', '')}",
         f"From: {record.get('from_number') or 'Unknown'}",
         f"To: {record.get('to_number') or 'Unknown'}",
@@ -177,17 +193,16 @@ def build_summary(record):
     ])
 
 
+# -----------------------------
+# EMAIL / SMS
+# -----------------------------
 def send_email(subject, body):
-    print("EMAIL DEBUG: starting send_email")
+    logging.info("EMAIL DEBUG: starting send_email")
 
     if not all([SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO]):
-        print("EMAIL DEBUG: missing SMTP config")
-        print("EMAIL DEBUG: SMTP_HOST =", SMTP_HOST)
-        print("EMAIL DEBUG: SMTP_PORT =", SMTP_PORT)
-        print("EMAIL DEBUG: SMTP_USERNAME =", SMTP_USERNAME)
-        print("EMAIL DEBUG: SMTP_PASSWORD exists =", bool(SMTP_PASSWORD))
-        print("EMAIL DEBUG: EMAIL_FROM =", EMAIL_FROM)
-        print("EMAIL DEBUG: EMAIL_TO =", EMAIL_TO)
+        logging.error("EMAIL DEBUG: missing SMTP config")
+        logging.error(f"EMAIL DEBUG: EMAIL_FROM={EMAIL_FROM}")
+        logging.error(f"EMAIL DEBUG: EMAIL_TO={EMAIL_TO}")
         return False
 
     try:
@@ -198,23 +213,21 @@ def send_email(subject, body):
         msg.set_content(body)
 
         if SMTP_USE_TLS:
-            print("EMAIL DEBUG: using TLS")
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
                 server.starttls()
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
                 server.send_message(msg)
         else:
-            print("EMAIL DEBUG: using SSL")
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
                 server.send_message(msg)
 
-        print("EMAIL DEBUG: email sent successfully")
+        logging.info("EMAIL DEBUG: email sent successfully")
         return True
 
     except Exception as exc:
-        print(f"EMAIL DEBUG: send failed: {exc}")
-        print(traceback.format_exc())
+        logging.error(f"EMAIL DEBUG: send failed: {exc}")
+        logging.error(traceback.format_exc())
         return False
 
 
@@ -225,89 +238,133 @@ def get_twilio_client():
 
 
 def send_sms(body):
-    print("SMS DEBUG: starting send_sms")
+    logging.info("SMS DEBUG: starting send_sms")
 
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, SMS_FROM, SMS_TO]):
-        print("SMS DEBUG: missing Twilio SMS config")
-        print("SMS DEBUG: SID exists =", bool(TWILIO_ACCOUNT_SID))
-        print("SMS DEBUG: TOKEN exists =", bool(TWILIO_AUTH_TOKEN))
-        print("SMS DEBUG: SMS_FROM =", SMS_FROM)
-        print("SMS DEBUG: SMS_TO =", SMS_TO)
+        logging.error("SMS DEBUG: missing Twilio SMS config")
+        logging.error(f"SMS DEBUG: SMS_FROM={SMS_FROM}")
+        logging.error(f"SMS DEBUG: SMS_TO={SMS_TO}")
         return False
 
     try:
         client = get_twilio_client()
         if client is None:
-            print("SMS DEBUG: Twilio client not available")
+            logging.error("SMS DEBUG: Twilio client not available")
             return False
 
-        client.messages.create(
+        message = client.messages.create(
             body=body[:1500],
             from_=SMS_FROM,
             to=SMS_TO,
         )
-        print("SMS DEBUG: sms sent successfully")
+        logging.info(f"SMS DEBUG: sms sent successfully sid={message.sid}")
         return True
 
     except Exception as exc:
-        print(f"SMS DEBUG: send failed: {exc}")
-        print(traceback.format_exc())
+        logging.error(f"SMS DEBUG: send failed: {exc}")
+        logging.error(traceback.format_exc())
         return False
 
 
-def send_notifications_if_needed(call_sid, reason="completed"):
-    print(f"NOTIFY DEBUG: starting send_notifications_if_needed for {call_sid} with reason={reason}")
+# -----------------------------
+# GOOGLE SHEETS
+# -----------------------------
+def append_to_google_sheet_if_needed(call_sid):
+    logging.info(f"SHEET DEBUG: starting append for {call_sid}")
 
     record = get_call(call_sid)
     if not record:
-        print(f"NOTIFY DEBUG: no record found for {call_sid}")
-        return
+        logging.error("SHEET DEBUG: no record found")
+        return False
 
-    if int(record.get("notifications_sent") or 0) == 1:
-        print(f"NOTIFY DEBUG: notifications already sent for {call_sid}")
-        return
+    if int(record.get("sheet_logged") or 0) == 1:
+        logging.info("SHEET DEBUG: already logged")
+        return True
 
-    summary = build_summary(record)
-    subject = f"ICC Call Lead - {normalize_answer(record.get('caller_name'), 'Unknown Caller')}"
-    sms_body = (
-        f"ICC Lead | "
-        f"Human: {'Yes' if int(record.get('transfer_requested') or 0) == 1 else 'No'} | "
-        f"Name: {normalize_answer(record.get('caller_name'))} | "
-        f"Project: {normalize_answer(record.get('project_type'))} | "
-        f"City: {normalize_answer(record.get('city'))} | "
-        f"Timeline: {normalize_answer(record.get('timeline'))} | "
-        f"Status: {record.get('call_status') or 'Unknown'}"
-    )
-
-    email_ok = False
-    sms_ok = False
-    errors = []
+    if not GOOGLE_SHEET_NAME or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        logging.error("SHEET DEBUG: missing Google Sheet config")
+        return False
 
     try:
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        client = gspread.authorize(credentials)
+        sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+
+        row = [
+            now_iso(),
+            record.get("call_sid", "") or "",
+            record.get("from_number", "") or "",
+            record.get("to_number", "") or "",
+            record.get("call_status", "") or "",
+            "Yes" if int(record.get("transfer_requested") or 0) == 1 else "No",
+            record.get("transfer_to", "") or "",
+            record.get("project_type", "") or "",
+            record.get("city", "") or "",
+            record.get("timeline", "") or "",
+            record.get("caller_name", "") or "",
+            record.get("error_message", "") or "",
+        ]
+
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        update_call(call_sid, sheet_logged=1)
+        logging.info("SHEET DEBUG: row appended successfully")
+        return True
+
+    except Exception as exc:
+        logging.error(f"SHEET DEBUG: append failed: {exc}")
+        logging.error(traceback.format_exc())
+        return False
+
+
+# -----------------------------
+# NOTIFICATIONS
+# -----------------------------
+def process_end_of_call_if_needed(call_sid, reason="completed"):
+    logging.info(f"FINALIZE DEBUG: starting process for {call_sid} reason={reason}")
+
+    record = get_call(call_sid)
+    if not record:
+        logging.error("FINALIZE DEBUG: no record found")
+        return
+
+    # Email + SMS
+    if int(record.get("notifications_sent") or 0) != 1:
+        summary = build_summary(record)
+        subject = f"ICC Call Lead - {normalize_answer(record.get('caller_name'), 'Unknown Caller')}"
+        sms_body = (
+            f"ICC Lead | "
+            f"Human: {'Yes' if int(record.get('transfer_requested') or 0) == 1 else 'No'} | "
+            f"Name: {normalize_answer(record.get('caller_name'))} | "
+            f"Project: {normalize_answer(record.get('project_type'))} | "
+            f"City: {normalize_answer(record.get('city'))} | "
+            f"Timeline: {normalize_answer(record.get('timeline'))} | "
+            f"Status: {record.get('call_status') or 'Unknown'}"
+        )
+
         email_ok = send_email(subject, summary)
-        print(f"NOTIFY DEBUG: email_ok={email_ok}")
-    except Exception as exc:
-        print(traceback.format_exc())
-        errors.append(f"Email failed: {exc}")
-
-    try:
         sms_ok = send_sms(sms_body)
-        print(f"NOTIFY DEBUG: sms_ok={sms_ok}")
-    except Exception as exc:
-        print(traceback.format_exc())
-        errors.append(f"SMS failed: {exc}")
 
-    if email_ok or sms_ok:
-        update_call(call_sid, notifications_sent=1, notification_reason=reason)
-        print(f"NOTIFY DEBUG: notifications marked as sent for {call_sid}")
-    elif errors:
-        update_call(call_sid, error_message=" | ".join(errors))
-        print(f"NOTIFY DEBUG: saved notification errors for {call_sid}")
+        if email_ok or sms_ok:
+            update_call(call_sid, notifications_sent=1, notification_reason=reason)
+            logging.info("FINALIZE DEBUG: notifications marked as sent")
+        else:
+            update_call(call_sid, error_message="Email and SMS both failed")
+            logging.error("FINALIZE DEBUG: email and sms both failed")
     else:
-        update_call(call_sid, error_message="Email and SMS both returned False")
-        print(f"NOTIFY DEBUG: both email and SMS returned False for {call_sid}")
+        logging.info("FINALIZE DEBUG: notifications already sent")
+
+    # Google Sheet
+    append_to_google_sheet_if_needed(call_sid)
 
 
+# -----------------------------
+# TWIML BUILDERS
+# -----------------------------
 def intro_menu_twiml():
     response = VoiceResponse()
 
@@ -323,7 +380,7 @@ def intro_menu_twiml():
         "For a new project or estimate, stay on the line. "
         "To speak with someone right away, press 1.",
         voice=VOICE_NAME,
-        language=VOICE_LANGUAGE
+        language=VOICE_LANGUAGE,
     )
     response.append(gather)
 
@@ -342,7 +399,7 @@ def ask_question_twiml(question_text, step_number):
         timeout=4,
         speech_timeout="auto",
         action_on_empty_result=True,
-        hints="kitchen,bathroom,closet,laundry room,office,garage,new construction,remodel,seattle,bellevue,kirkland,lynnwood,redmond,bothell"
+        hints="kitchen,bathroom,closet,laundry room,office,garage,new construction,remodel,seattle,bellevue,kirkland,lynnwood,redmond,bothell",
     )
     gather.say(question_text, voice=VOICE_NAME, language=VOICE_LANGUAGE)
     response.append(gather)
@@ -362,18 +419,21 @@ def transfer_to_human_twiml(call_sid):
     response = VoiceResponse()
 
     if not HUMAN_TRANSFER_NUMBER:
-        print("TRANSFER DEBUG: HUMAN_TRANSFER_NUMBER missing")
         update_call(call_sid, error_message="Human transfer requested but HUMAN_TRANSFER_NUMBER is missing")
         response.say(
             "Sorry, we could not connect you right now. We will follow up shortly.",
             voice=VOICE_NAME,
-            language=VOICE_LANGUAGE
+            language=VOICE_LANGUAGE,
         )
         response.hangup()
         return xml_response(str(response))
 
-    print(f"TRANSFER DEBUG: transferring {call_sid} to {HUMAN_TRANSFER_NUMBER}")
-    update_call(call_sid, transfer_requested=1, transfer_to=HUMAN_TRANSFER_NUMBER, last_field="human_transfer")
+    update_call(
+        call_sid,
+        transfer_requested=1,
+        transfer_to=HUMAN_TRANSFER_NUMBER,
+        last_field="human_transfer",
+    )
 
     response.say("Please hold while I connect you.", voice=VOICE_NAME, language=VOICE_LANGUAGE)
     response.dial(HUMAN_TRANSFER_NUMBER, timeout=20, caller_id=request.values.get("To", ""))
@@ -382,6 +442,9 @@ def transfer_to_human_twiml(call_sid):
     return xml_response(str(response))
 
 
+# -----------------------------
+# ROUTES
+# -----------------------------
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"ok": True, "service": "icc-voice-agent"}), 200
@@ -395,7 +458,7 @@ def sms_webhook():
 @app.route("/voice", methods=["POST"])
 def voice():
     call_sid = safe_text(request.values.get("CallSid", ""))
-    print(f"VOICE DEBUG: incoming call, CallSid={call_sid}")
+    logging.info(f"VOICE DEBUG: incoming call sid={call_sid}")
 
     try:
         if not call_sid:
@@ -411,7 +474,7 @@ def voice():
         return intro_menu_twiml()
 
     except Exception as exc:
-        print(traceback.format_exc())
+        logging.error(traceback.format_exc())
         if call_sid:
             update_call(call_sid, error_message=f"/voice failure: {safe_text(str(exc), 500)}")
         return say_and_hangup("Sorry, there was a system issue. We will follow up.")
@@ -421,7 +484,7 @@ def voice():
 def menu():
     call_sid = safe_text(request.values.get("CallSid", ""))
     digit = safe_text(request.values.get("Digits", ""))
-    print(f"MENU DEBUG: CallSid={call_sid}, Digits={digit}")
+    logging.info(f"MENU DEBUG: sid={call_sid} digit={digit}")
 
     try:
         if not call_sid:
@@ -440,7 +503,7 @@ def menu():
         return ask_question_twiml(QUESTIONS[0][1], 0)
 
     except Exception as exc:
-        print(traceback.format_exc())
+        logging.error(traceback.format_exc())
         if call_sid:
             update_call(call_sid, error_message=f"/menu failure: {safe_text(str(exc), 500)}")
         return say_and_hangup("Sorry, there was a system issue. We will follow up.")
@@ -449,7 +512,7 @@ def menu():
 @app.route("/start-intake", methods=["POST"])
 def start_intake():
     call_sid = safe_text(request.values.get("CallSid", ""))
-    print(f"START INTAKE DEBUG: CallSid={call_sid}")
+    logging.info(f"START INTAKE DEBUG: sid={call_sid}")
 
     try:
         if not call_sid:
@@ -465,7 +528,7 @@ def start_intake():
         return ask_question_twiml(QUESTIONS[0][1], 0)
 
     except Exception as exc:
-        print(traceback.format_exc())
+        logging.error(traceback.format_exc())
         if call_sid:
             update_call(call_sid, error_message=f"/start-intake failure: {safe_text(str(exc), 500)}")
         return say_and_hangup("Sorry, there was a system issue. We will follow up.")
@@ -476,8 +539,7 @@ def gather():
     call_sid = safe_text(request.values.get("CallSid", ""))
     speech_result = safe_text(request.values.get("SpeechResult", ""))
     step_raw = request.args.get("step", "0")
-
-    print(f"GATHER DEBUG: CallSid={call_sid}, step={step_raw}, SpeechResult={speech_result}")
+    logging.info(f"GATHER DEBUG: sid={call_sid} step={step_raw} speech={speech_result}")
 
     try:
         if not call_sid:
@@ -499,7 +561,6 @@ def gather():
             field_name = QUESTIONS[step_number][0]
             answer = normalize_answer(speech_result)
             update_call(call_sid, **{field_name: answer}, last_field=field_name)
-            print(f"GATHER DEBUG: saved {field_name}={answer}")
 
         next_step = step_number + 1
 
@@ -508,7 +569,7 @@ def gather():
 
         record = get_call(call_sid)
         update_call(call_sid, call_status="completed")
-        print(f"GATHER DEBUG: completed call for {call_sid}")
+        logging.info(f"GATHER DEBUG: completed call sid={call_sid}")
 
         return say_and_hangup(
             f"Thank you {normalize_answer(record.get('caller_name'), 'there')}. "
@@ -518,7 +579,7 @@ def gather():
         )
 
     except Exception as exc:
-        print(traceback.format_exc())
+        logging.error(traceback.format_exc())
         if call_sid:
             update_call(call_sid, error_message=f"/gather failure: {safe_text(str(exc), 500)}")
         return say_and_hangup("Sorry, there was a system issue. We will follow up.")
@@ -528,12 +589,10 @@ def gather():
 def status_callback():
     call_sid = safe_text(request.values.get("CallSid", ""))
     call_status = safe_text(request.values.get("CallStatus", ""))
-
-    print(f"STATUS DEBUG: CallSid={call_sid}, CallStatus={call_status}")
+    logging.info(f"STATUS DEBUG: sid={call_sid} status={call_status}")
 
     try:
         if not call_sid:
-            print("STATUS DEBUG: missing CallSid")
             return ("", 204)
 
         upsert_call(
@@ -544,35 +603,36 @@ def status_callback():
         )
 
         if call_status in {"completed", "busy", "failed", "no-answer", "canceled"}:
-            print(f"STATUS DEBUG: terminal status received: {call_status}")
-            send_notifications_if_needed(call_sid, reason=f"status:{call_status}")
-        else:
-            print(f"STATUS DEBUG: non-terminal status, skipping notifications: {call_status}")
+            process_end_of_call_if_needed(call_sid, reason=f"status:{call_status}")
 
         return ("", 204)
 
     except Exception:
-        print(traceback.format_exc())
+        logging.error(traceback.format_exc())
         return ("", 204)
 
 
 @app.errorhandler(Exception)
 def handle_error(exc):
     call_sid = safe_text(request.values.get("CallSid", "")) if request else ""
-    print(traceback.format_exc())
+    logging.error(traceback.format_exc())
 
     if call_sid:
         try:
             update_call(call_sid, error_message=f"Unhandled app error: {safe_text(str(exc), 500)}")
         except Exception:
-            print(traceback.format_exc())
+            logging.error(traceback.format_exc())
 
     return say_and_hangup("Sorry, there was a system issue. We will follow up.")
 
 
+# -----------------------------
+# STARTUP
+# -----------------------------
 init_db()
 ensure_column_exists("transfer_requested", "transfer_requested INTEGER DEFAULT 0")
 ensure_column_exists("transfer_to", "transfer_to TEXT")
+ensure_column_exists("sheet_logged", "sheet_logged INTEGER DEFAULT 0")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
