@@ -35,8 +35,11 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "")
 VOICE_LANGUAGE = os.environ.get("VOICE_LANGUAGE", "en-US")
 VOICE_NAME = os.environ.get("VOICE_NAME", "alice")
 
+# This is your real phone number that Twilio should call when user presses 1
+HUMAN_TRANSFER_NUMBER = os.environ.get("HUMAN_TRANSFER_NUMBER", "")
+
 QUESTIONS = [
-    ("project_type", "Thanks for calling Italian Custom Cabinets. What type of project is this? For example, kitchen, bathroom, or closet."),
+    ("project_type", "What type of project is this? For example, kitchen, bathroom, or closet."),
     ("city", "What city is the project in?"),
     ("timeline", "What is your timeline for the project?"),
     ("caller_name", "What is your name?"),
@@ -91,12 +94,24 @@ def init_db():
             notifications_sent INTEGER DEFAULT 0,
             notification_reason TEXT,
             error_message TEXT,
+            transfer_requested INTEGER DEFAULT 0,
+            transfer_to TEXT,
             created_at TEXT,
             updated_at TEXT
         )
         """
     )
     conn.commit()
+    conn.close()
+
+
+def ensure_column_exists(column_name, column_sql):
+    conn = get_conn()
+    cols = conn.execute("PRAGMA table_info(calls)").fetchall()
+    existing = {row["name"] for row in cols}
+    if column_name not in existing:
+        conn.execute(f"ALTER TABLE calls ADD COLUMN {column_sql}")
+        conn.commit()
     conn.close()
 
 
@@ -159,6 +174,8 @@ def build_summary(record):
         f"From: {record.get('from_number') or 'Unknown'}",
         f"To: {record.get('to_number') or 'Unknown'}",
         f"Status: {record.get('call_status') or 'Unknown'}",
+        f"Transferred to human: {'Yes' if int(record.get('transfer_requested') or 0) == 1 else 'No'}",
+        f"Transfer destination: {normalize_answer(record.get('transfer_to'), fallback='None')}",
         f"Project type: {normalize_answer(record.get('project_type'))}",
         f"City: {normalize_answer(record.get('city'))}",
         f"Timeline: {normalize_answer(record.get('timeline'))}",
@@ -262,6 +279,7 @@ def send_notifications_if_needed(call_sid, reason="completed"):
     subject = f"ICC Call Lead - {normalize_answer(record.get('caller_name'), 'Unknown Caller')}"
     sms_body = (
         f"ICC Lead | "
+        f"Human: {'Yes' if int(record.get('transfer_requested') or 0) == 1 else 'No'} | "
         f"Name: {normalize_answer(record.get('caller_name'))} | "
         f"Project: {normalize_answer(record.get('project_type'))} | "
         f"City: {normalize_answer(record.get('city'))} | "
@@ -302,6 +320,30 @@ def send_notifications_if_needed(call_sid, reason="completed"):
         print(f"NOTIFY DEBUG: both email and SMS returned False for {call_sid}")
 
 
+def intro_menu_twiml():
+    response = VoiceResponse()
+
+    gather = Gather(
+        input="dtmf",
+        num_digits=1,
+        action=f"{BASE_URL}/menu",
+        method="POST",
+        timeout=5,
+    )
+    gather.say(
+        "Thank you for calling Italian Custom Cabinets. "
+        "For a new project or estimate, stay on the line. "
+        "To speak with someone right away, press 1.",
+        voice=VOICE_NAME,
+        language=VOICE_LANGUAGE
+    )
+    response.append(gather)
+
+    # If no key is pressed, continue to AI intake
+    response.redirect(f"{BASE_URL}/start-intake", method="POST")
+    return xml_response(str(response))
+
+
 def ask_question_twiml(question_text, step_number):
     response = VoiceResponse()
 
@@ -319,13 +361,48 @@ def ask_question_twiml(question_text, step_number):
     response.append(gather)
 
     response.redirect(f"{BASE_URL}/gather?step={step_number}", method="POST")
-
     return xml_response(str(response))
 
 
 def say_and_hangup(text):
     response = VoiceResponse()
     response.say(text, voice=VOICE_NAME, language=VOICE_LANGUAGE)
+    response.hangup()
+    return xml_response(str(response))
+
+
+def transfer_to_human_twiml(call_sid):
+    response = VoiceResponse()
+
+    if not HUMAN_TRANSFER_NUMBER:
+        print("TRANSFER DEBUG: HUMAN_TRANSFER_NUMBER missing")
+        update_call(call_sid, error_message="Human transfer requested but HUMAN_TRANSFER_NUMBER is missing")
+        response.say(
+            "Sorry, we could not connect you right now. Please leave your information after the tone, or call back shortly.",
+            voice=VOICE_NAME,
+            language=VOICE_LANGUAGE
+        )
+        response.hangup()
+        return xml_response(str(response))
+
+    print(f"TRANSFER DEBUG: transferring {call_sid} to {HUMAN_TRANSFER_NUMBER}")
+    update_call(call_sid, transfer_requested=1, transfer_to=HUMAN_TRANSFER_NUMBER, last_field="human_transfer")
+
+    response.say(
+        "Please hold while I connect you.",
+        voice=VOICE_NAME,
+        language=VOICE_LANGUAGE
+    )
+    response.dial(
+        HUMAN_TRANSFER_NUMBER,
+        timeout=20,
+        caller_id=request.values.get("To", "")
+    )
+    response.say(
+        "Sorry, no one is available right now. We will follow up shortly.",
+        voice=VOICE_NAME,
+        language=VOICE_LANGUAGE
+    )
     response.hangup()
     return xml_response(str(response))
 
@@ -359,12 +436,66 @@ def voice():
             call_status=request.values.get("CallStatus", "in-progress"),
         )
 
-        return ask_question_twiml(QUESTIONS[0][1], 0)
+        return intro_menu_twiml()
 
     except Exception as exc:
         print(traceback.format_exc())
         if call_sid:
             update_call(call_sid, error_message=f"/voice failure: {safe_text(str(exc), 500)}")
+        return say_and_hangup("Sorry, there was a system issue. We will follow up.")
+
+
+@app.route("/menu", methods=["POST"])
+def menu():
+    call_sid = safe_text(request.values.get("CallSid", ""))
+    digit = safe_text(request.values.get("Digits", ""))
+    print(f"MENU DEBUG: CallSid={call_sid}, Digits={digit}")
+
+    try:
+        if not call_sid:
+            return say_and_hangup("Sorry, this call could not be processed.")
+
+        upsert_call(
+            call_sid=call_sid,
+            from_number=request.values.get("From", ""),
+            to_number=request.values.get("To", ""),
+            call_status=request.values.get("CallStatus", "in-progress"),
+        )
+
+        if digit == "1":
+            return transfer_to_human_twiml(call_sid)
+
+        return ask_question_twiml(QUESTIONS[0][1], 0)
+
+    except Exception as exc:
+        print(traceback.format_exc())
+        if call_sid:
+            update_call(call_sid, error_message=f"/menu failure: {safe_text(str(exc), 500)}")
+        return say_and_hangup("Sorry, there was a system issue. We will follow up.")
+
+
+@app.route("/start-intake", methods=["POST"])
+def start_intake():
+    call_sid = safe_text(request.values.get("CallSid", ""))
+    print(f"START INTAKE DEBUG: CallSid={call_sid}")
+
+    try:
+        if not call_sid:
+            return say_and_hangup("Sorry, this call could not be processed.")
+
+        upsert_call(
+            call_sid=call_sid,
+            from_number=request.values.get("From", ""),
+            to_number=request.values.get("To", ""),
+            call_status=request.values.get("CallStatus", "in-progress"),
+        )
+
+        return ask_question_twiml(QUESTIONS[0][1], 0)
+
+    except Exception as exc:
+        print(traceback.format_exc())
+        if call_sid:
+            update_call(call_sid, error_message=f"/start-intake failure: {safe_text(str(exc), 500)}")
         return say_and_hangup("Sorry, there was a system issue. We will follow up.")
 
 
@@ -471,6 +602,8 @@ def handle_error(exc):
 # STARTUP
 # -----------------------------
 init_db()
+ensure_column_exists("transfer_requested", "transfer_requested INTEGER DEFAULT 0")
+ensure_column_exists("transfer_to", "transfer_to TEXT")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
